@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f0d0a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="HOF Calc" />
+  <meta name="description" content="MLB Hall of Fame probability calculator with career stat projections based on Baseball-Reference data." />
+  <title>HOF Calculator — Cooperstown Projection System</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&family=Playfair+Display:wght@700;800;900&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; width: 100%; }
+    body {
+      background: #0f0d0a;
+      color: #e8dcc8;
+      font-family: 'DM Sans', sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior: none;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+    button, input { min-height: 44px; }
+    input[type="text"] { font-size: 16px !important; }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
+      background: #c4913a; border: 2px solid #0f0d0a; cursor: pointer;
+      box-shadow: 0 0 6px rgba(196,145,58,0.4);
+    }
+    input[type="range"]::-moz-range-thumb {
+      width: 18px; height: 18px; border-radius: 50%;
+      background: #c4913a; border: 2px solid #0f0d0a; cursor: pointer;
+    }
+    ::selection { background: rgba(196,145,58,0.3); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useCallback, useMemo, useEffect } = React;
+
+    // ─── DATA ───
+    const POSITION_JAWS = {
+      C:  { avg: 40.0, label: "Catcher" },
+      "1B": { avg: 55.2, label: "First Base" },
+      "2B": { avg: 51.5, label: "Second Base" },
+      "3B": { avg: 55.2, label: "Third Base" },
+      SS: { avg: 52.5, label: "Shortstop" },
+      LF: { avg: 54.0, label: "Left Field" },
+      CF: { avg: 57.0, label: "Center Field" },
+      RF: { avg: 56.0, label: "Right Field" },
+      DH: { avg: 52.0, label: "Designated Hitter" },
+      SP: { avg: 62.1, label: "Starting Pitcher" },
+      RP: { avg: 36.0, label: "Relief Pitcher" },
+    };
+
+    const MILESTONES = {
+      batter: {
+        hits_3000: { threshold: 3000, label: "3,000 Hit Club", weight: 35 },
+        hits_2500: { threshold: 2500, label: "2,500+ Hits", weight: 15 },
+        hr_500: { threshold: 500, label: "500 HR Club", weight: 30 },
+        hr_350: { threshold: 350, label: "350+ HR", weight: 10 },
+        rbi_1500: { threshold: 1500, label: "1,500+ RBI", weight: 10 },
+        avg_300: { threshold: 0.300, label: ".300+ Career AVG", weight: 8 },
+        ops_plus_125: { threshold: 125, label: "125+ OPS+", weight: 12 },
+        war_60: { threshold: 60, label: "60+ Career WAR", weight: 25 },
+        war_45: { threshold: 45, label: "45+ Career WAR", weight: 12 },
+        allstar_8: { threshold: 8, label: "8+ All-Star Games", weight: 10 },
+        mvp: { threshold: 1, label: "MVP Award(s)", weight: 12 },
+        gold_glove_5: { threshold: 5, label: "5+ Gold Gloves", weight: 5 },
+      },
+      pitcher: {
+        wins_300: { threshold: 300, label: "300 Win Club", weight: 30 },
+        wins_240: { threshold: 240, label: "240+ Wins", weight: 15 },
+        k_3000: { threshold: 3000, label: "3,000 K Club", weight: 25 },
+        k_2800: { threshold: 2800, label: "2,800+ K", weight: 12 },
+        era_plus_125: { threshold: 125, label: "125+ ERA+", weight: 15 },
+        war_60: { threshold: 60, label: "60+ Career WAR", weight: 25 },
+        war_45: { threshold: 45, label: "45+ Career WAR", weight: 12 },
+        cy_young: { threshold: 1, label: "Cy Young Award(s)", weight: 15 },
+        allstar_6: { threshold: 6, label: "6+ All-Star Games", weight: 8 },
+      }
+    };
+
+    const AGING_CURVE_BATTER = {
+      20: 1.0, 21: 1.8, 22: 2.5, 23: 3.2, 24: 3.9, 25: 4.5, 26: 4.8, 27: 5.0,
+      28: 4.9, 29: 4.7, 30: 4.4, 31: 4.0, 32: 3.6, 33: 3.2, 34: 2.8,
+      35: 2.4, 36: 2.0, 37: 1.6, 38: 1.2, 39: 0.9, 40: 0.6, 41: 0.4, 42: 0.2
+    };
+    const AGING_CURVE_PITCHER = {
+      20: 0.5, 21: 1.2, 22: 2.0, 23: 2.8, 24: 3.4, 25: 3.9, 26: 4.3, 27: 4.5,
+      28: 4.4, 29: 4.2, 30: 3.9, 31: 3.5, 32: 3.1, 33: 2.7, 34: 2.3,
+      35: 1.9, 36: 1.5, 37: 1.1, 38: 0.8, 39: 0.5, 40: 0.3, 41: 0.2, 42: 0.1
+    };
+
+    const SEASON_RATES_BATTER = {
+      hits: { peak: 185 }, hr: { peak: 35 }, rbi: { peak: 105 },
+      runs: { peak: 100 }, sb: { peak: 25 },
+    };
+    const SEASON_RATES_PITCHER = {
+      wins: { peak: 16 }, k: { peak: 220 }, saves: { peak: 38 }, ip: { peak: 200 },
+    };
+
+    // ─── CALCULATION ───
+    function calculateHOFProbability(stats, position, isPitcher) {
+      let score = 0, maxScore = 0, milestoneHits = [];
+      const milestones = isPitcher ? MILESTONES.pitcher : MILESTONES.batter;
+
+      for (const [key, m] of Object.entries(milestones)) {
+        maxScore += m.weight;
+        let statVal = null;
+        if (key === "hits_3000" || key === "hits_2500") statVal = stats.hits;
+        else if (key === "hr_500" || key === "hr_350") statVal = stats.hr;
+        else if (key === "rbi_1500") statVal = stats.rbi;
+        else if (key === "avg_300") statVal = stats.avg;
+        else if (key === "ops_plus_125") statVal = stats.opsPlus;
+        else if (key.startsWith("war_")) statVal = stats.war;
+        else if (key === "allstar_8" || key === "allstar_6") statVal = stats.allstar;
+        else if (key === "mvp") statVal = stats.mvp;
+        else if (key === "gold_glove_5") statVal = stats.goldGlove;
+        else if (key === "wins_300" || key === "wins_240") statVal = stats.wins;
+        else if (key === "k_3000" || key === "k_2800") statVal = stats.k;
+        else if (key === "era_plus_125") statVal = stats.eraPlus;
+        else if (key === "cy_young") statVal = stats.cyYoung;
+
+        if (statVal !== null && statVal !== undefined && statVal !== "") {
+          const val = parseFloat(statVal);
+          if (!isNaN(val)) {
+            const ratio = val / m.threshold;
+            if (ratio >= 1) {
+              score += m.weight;
+              milestoneHits.push({ label: m.label, exceeded: true });
+            } else if (ratio >= 0.85) {
+              score += m.weight * (0.5 + 0.5 * ((ratio - 0.85) / 0.15));
+              milestoneHits.push({ label: m.label, exceeded: false, pct: Math.round(ratio * 100) });
+            } else if (ratio >= 0.7) {
+              score += m.weight * 0.2 * ((ratio - 0.7) / 0.15);
+            }
+          }
+        }
+      }
+
+      if (stats.war && position) {
+        const jd = POSITION_JAWS[position];
+        if (jd) {
+          const peak7 = stats.peak7war || stats.war * 0.55;
+          const jaws = (parseFloat(stats.war) + parseFloat(peak7)) / 2;
+          const jr = jaws / jd.avg;
+          if (jr >= 1.0) { score += 20; milestoneHits.push({ label: "JAWS \u2265 " + jd.avg.toFixed(1) + " (" + jd.label + " avg)", exceeded: true }); }
+          else if (jr >= 0.85) { score += 10; milestoneHits.push({ label: "JAWS approaching " + jd.label + " avg", exceeded: false, pct: Math.round(jr * 100) }); }
+          maxScore += 20;
+        }
+      }
+
+      const rawPct = maxScore > 0 ? (score / maxScore) * 100 : 0;
+      const probability = 100 / (1 + Math.exp(-0.08 * (rawPct - 40)));
+      return { probability: Math.min(99, Math.max(1, probability)), milestoneHits, rawPct };
+    }
+
+    function projectStats(currentStats, currentAge, targetAge, isPitcher, performanceMult) {
+      const projected = { ...currentStats };
+      const agingCurve = isPitcher ? AGING_CURVE_PITCHER : AGING_CURVE_BATTER;
+      const seasonRates = isPitcher ? SEASON_RATES_PITCHER : SEASON_RATES_BATTER;
+      const peakCurveWAR = agingCurve[27] || 5.0;
+      const currentWAR = parseFloat(currentStats.war) || 0;
+      const debutAge = isPitcher ? 22 : 21;
+      const seasonsPlayed = Math.max(1, currentAge - debutAge);
+
+      let expectedCurveTotal = 0;
+      for (let age = debutAge + 1; age <= currentAge; age++) {
+        expectedCurveTotal += agingCurve[age] || 1.0;
+      }
+      const playerTalent = expectedCurveTotal > 0 ? (currentWAR / expectedCurveTotal) : 1.0;
+
+      let projectedWar = currentWAR;
+      for (let age = currentAge + 1; age <= targetAge; age++) {
+        const curveVal = agingCurve[age] !== undefined ? agingCurve[age] : Math.max(0, 0.3 - (age - 42) * 0.15);
+        projectedWar += Math.max(0, curveVal * playerTalent * performanceMult);
+      }
+      projected.war = projectedWar.toFixed(1);
+
+      for (const [stat, rates] of Object.entries(seasonRates)) {
+        if (currentStats[stat] !== undefined && currentStats[stat] !== "") {
+          let currentVal = parseFloat(currentStats[stat]) || 0;
+          const playerRate = currentVal / Math.max(1, seasonsPlayed);
+          const currentAgeCurveFraction = (agingCurve[currentAge] || 1.0) / peakCurveWAR;
+
+          for (let age = currentAge + 1; age <= targetAge; age++) {
+            const futureCurveVal = agingCurve[age] !== undefined ? agingCurve[age] : 0.1;
+            const futureFraction = futureCurveVal / peakCurveWAR;
+            const ageAdjustedRate = currentAgeCurveFraction > 0
+              ? playerRate * (futureFraction / currentAgeCurveFraction)
+              : playerRate * futureFraction;
+            currentVal += Math.max(0, ageAdjustedRate * performanceMult);
+          }
+          projected[stat] = Math.round(currentVal);
+        }
+      }
+
+      if (currentStats.peak7war) {
+        let peak = parseFloat(currentStats.peak7war);
+        if (currentAge < 32) {
+          for (let age = currentAge + 1; age <= Math.min(targetAge, 33); age++) {
+            const curveVal = agingCurve[age] || 0;
+            const seasonWAR = curveVal * playerTalent * performanceMult;
+            const avgPeakSeason = peak / 7;
+            if (seasonWAR > avgPeakSeason * 0.8) {
+              peak += (seasonWAR - avgPeakSeason * 0.8) * 0.5;
+            }
+          }
+        }
+        projected.peak7war = peak;
+      }
+      return projected;
+    }
+
+    // ─── COMPONENTS ───
+    function StatInput({ label, name, value, onChange, placeholder, small, unit }) {
+      return (
+        <div style={small ? { flex: "1 1 0", minWidth: 0 } : {}}>
+          <label style={{ display: "block", fontSize: "10px", fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "#8B7355", marginBottom: "4px", fontFamily: "'DM Sans', sans-serif" }}>{label}</label>
+          <div style={{ position: "relative" }}>
+            <input type="text" inputMode="decimal" name={name} value={value} onChange={onChange} placeholder={placeholder || "\u2014"}
+              style={{ width: "100%", padding: "8px 10px", background: "#1a1612", border: "1px solid #3d3228", borderRadius: "6px", color: "#e8dcc8", fontSize: "15px", fontFamily: "'IBM Plex Mono', monospace", fontWeight: 500, outline: "none", transition: "border-color 0.2s, box-shadow 0.2s", boxSizing: "border-box" }}
+              onFocus={e => { e.target.style.borderColor = "#c4913a"; e.target.style.boxShadow = "0 0 0 2px rgba(196,145,58,0.15)"; }}
+              onBlur={e => { e.target.style.borderColor = "#3d3228"; e.target.style.boxShadow = "none"; }}
+            />
+            {unit && <span style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", fontSize: "10px", color: "#6b5c4a", fontFamily: "'DM Sans', sans-serif" }}>{unit}</span>}
+          </div>
+        </div>
+      );
+    }
+
+    function MilestoneChip({ label, exceeded, pct }) {
+      return (
+        <div style={{ display: "inline-flex", alignItems: "center", gap: "5px", padding: "4px 10px", borderRadius: "100px", fontSize: "11px", fontWeight: 600, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.02em",
+          background: exceeded ? "rgba(76,175,80,0.15)" : "rgba(196,145,58,0.12)",
+          color: exceeded ? "#7dcc80" : "#c4913a",
+          border: "1px solid " + (exceeded ? "rgba(76,175,80,0.3)" : "rgba(196,145,58,0.25)"),
+        }}>
+          <span style={{ fontSize: "13px" }}>{exceeded ? "\u2726" : "\u25C7"}</span>
+          {label}
+          {!exceeded && pct && <span style={{ opacity: 0.7 }}>({pct}%)</span>}
+        </div>
+      );
+    }
+
+    function StatChip({ label, value }) {
+      return (
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "18px", fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: "#e8dcc8" }}>{value}</div>
+          <div style={{ fontSize: "9px", fontWeight: 700, letterSpacing: "0.1em", color: "#6b5c4a", textTransform: "uppercase" }}>{label}</div>
+        </div>
+      );
+    }
+
+    function GaugeRing({ probability, size = 200 }) {
+      const sw = 14, r = (size - sw) / 2, c = 2 * Math.PI * r, prog = (probability / 100) * c;
+      const getColor = p => p >= 80 ? "#4CAF50" : p >= 60 ? "#8BC34A" : p >= 40 ? "#c4913a" : p >= 20 ? "#e67e22" : "#c0392b";
+      const getLabel = p => p >= 90 ? "LOCK" : p >= 75 ? "STRONG" : p >= 55 ? "LIKELY" : p >= 40 ? "BORDERLINE" : p >= 20 ? "LONG SHOT" : "UNLIKELY";
+      const color = getColor(probability);
+      return (
+        <div style={{ position: "relative", width: size, height: size }}>
+          <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+            <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#2a2320" strokeWidth={sw} />
+            <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={sw} strokeLinecap="round"
+              strokeDasharray={c} strokeDashoffset={c - prog}
+              style={{ transition: "stroke-dashoffset 0.8s cubic-bezier(0.4,0,0.2,1), stroke 0.5s" }} />
+          </svg>
+          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ fontSize: "42px", fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: color, lineHeight: 1 }}>{probability.toFixed(1)}</div>
+            <div style={{ fontSize: "11px", fontWeight: 700, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.15em", color: "#8B7355", marginTop: "2px" }}>% PROBABILITY</div>
+            <div style={{ marginTop: "6px", padding: "2px 12px", borderRadius: "100px", background: color + "18", border: "1px solid " + color + "40", fontSize: "10px", fontWeight: 800, letterSpacing: "0.12em", color: color, fontFamily: "'DM Sans', sans-serif" }}>{getLabel(probability)}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── PRESETS ───
+    const PRESETS = {
+      "Mike Trout": { type: "batter", pos: "CF", age: 34, stats: { war: "85.2", peak7war: "57.5", hits: "1578", hr: "378", rbi: "940", avg: ".276", opsPlus: "171", allstar: "11", mvp: "3", goldGlove: "0", runs: "1052", sb: "213" }},
+      "Aaron Judge": { type: "batter", pos: "RF", age: 33, stats: { war: "54.8", peak7war: "42.1", hits: "1035", hr: "327", rbi: "770", avg: ".280", opsPlus: "176", allstar: "6", mvp: "2", goldGlove: "0", runs: "742", sb: "42" }},
+      "Shohei Ohtani": { type: "batter", pos: "DH", age: 31, stats: { war: "48.4", peak7war: "38.0", hits: "948", hr: "263", rbi: "661", avg: ".278", opsPlus: "165", allstar: "4", mvp: "3", goldGlove: "0", runs: "661", sb: "110" }},
+      "Mookie Betts": { type: "batter", pos: "RF", age: 33, stats: { war: "55.6", peak7war: "41.2", hits: "1477", hr: "261", rbi: "789", avg: ".288", opsPlus: "136", allstar: "7", mvp: "1", goldGlove: "6", runs: "918", sb: "170" }},
+      "Freddie Freeman": { type: "batter", pos: "1B", age: 36, stats: { war: "62.1", peak7war: "38.6", hits: "2317", hr: "342", rbi: "1259", avg: ".298", opsPlus: "140", allstar: "8", mvp: "1", goldGlove: "1", runs: "1306", sb: "130" }},
+      "Juan Soto": { type: "batter", pos: "LF", age: 27, stats: { war: "42.6", peak7war: "35.8", hits: "958", hr: "201", rbi: "596", avg: ".281", opsPlus: "155", allstar: "5", mvp: "0", goldGlove: "0", runs: "674", sb: "47" }},
+      "Manny Machado": { type: "batter", pos: "3B", age: 33, stats: { war: "61.7", peak7war: "38.4", hits: "1933", hr: "326", rbi: "1051", avg: ".272", opsPlus: "119", allstar: "6", mvp: "0", goldGlove: "2", runs: "1010", sb: "90" }},
+      "Corbin Burnes": { type: "pitcher", pos: "SP", age: 31, stats: { war: "25.1", peak7war: "22.0", wins: "67", k: "1100", eraPlus: "145", cyYoung: "1", allstar: "4", saves: "0", ip: "935" }},
+      "Gerrit Cole": { type: "pitcher", pos: "SP", age: 35, stats: { war: "47.2", peak7war: "35.8", wins: "148", k: "2199", eraPlus: "135", cyYoung: "1", allstar: "6", saves: "0", ip: "1870" }},
+    };
+
+    // ─── MAIN APP ───
+    function App() {
+      const [playerType, setPlayerType] = useState("batter");
+      const [position, setPosition] = useState("SS");
+      const [playerName, setPlayerName] = useState("");
+      const [currentAge, setCurrentAge] = useState(28);
+      const [projectionAge, setProjectionAge] = useState(28);
+      const [performanceMult, setPerformanceMult] = useState(1.0);
+      const [showProjection, setShowProjection] = useState(false);
+      const [resetKey, setResetKey] = useState(0);
+      const isPitcher = playerType === "pitcher";
+
+      const emptyStats = { war: "", peak7war: "", hits: "", hr: "", rbi: "", avg: "", opsPlus: "", allstar: "", mvp: "", goldGlove: "", runs: "", sb: "", wins: "", k: "", eraPlus: "", cyYoung: "", saves: "", ip: "" };
+      const [stats, setStats] = useState(emptyStats);
+
+      const handleStatChange = useCallback(e => {
+        setStats(prev => ({ ...prev, [e.target.name]: e.target.value }));
+      }, []);
+
+      const resetAll = () => {
+        setStats({ ...emptyStats });
+        setPlayerName("");
+        setPlayerType("batter");
+        setPosition("SS");
+        setCurrentAge(28);
+        setProjectionAge(28);
+        setShowProjection(false);
+        setPerformanceMult(1.0);
+        setResetKey(k => k + 1);
+      };
+
+      const activeStats = useMemo(() => {
+        if (showProjection && projectionAge > currentAge) return projectStats(stats, currentAge, projectionAge, isPitcher, performanceMult);
+        return stats;
+      }, [stats, showProjection, projectionAge, currentAge, isPitcher, performanceMult]);
+
+      const result = useMemo(() => {
+        if (!Object.values(stats).some(v => v !== "")) return null;
+        return calculateHOFProbability(activeStats, position, isPitcher);
+      }, [activeStats, position, isPitcher, stats]);
+
+      const batterPositions = ["C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"];
+      const pitcherPositions = ["SP", "RP"];
+      const positions = isPitcher ? pitcherPositions : batterPositions;
+
+      useEffect(() => {
+        if (isPitcher && !["SP","RP"].includes(position)) setPosition("SP");
+        if (!isPitcher && !batterPositions.includes(position)) setPosition("SS");
+      }, [isPitcher]);
+
+      const loadPreset = name => {
+        const p = PRESETS[name];
+        setPlayerType(p.type);
+        setPosition(p.pos);
+        setCurrentAge(p.age);
+        setProjectionAge(p.age);
+        setPlayerName(name);
+        setShowProjection(false);
+        setPerformanceMult(1.0);
+        setStats({ ...emptyStats, ...p.stats });
+      };
+
+      const rangeStyle = (val, min, max) => ({
+        width: "100%", height: "6px", WebkitAppearance: "none", appearance: "none", borderRadius: "3px",
+        background: "linear-gradient(to right, #c4913a 0%, #c4913a " + ((val - min) / (max - min) * 100) + "%, #2a2320 " + ((val - min) / (max - min) * 100) + "%, #2a2320 100%)",
+        outline: "none", cursor: "pointer",
+      });
+
+      const sectionStyle = { background: "#14110e", border: "1px solid #2a2320", borderRadius: "12px", padding: "16px", marginBottom: "16px" };
+      const sectionTitle = color => ({ fontSize: "11px", fontWeight: 700, letterSpacing: "0.1em", color: color || "#c4913a", marginBottom: "12px", textTransform: "uppercase" });
+      const rowStyle = { display: "flex", gap: "8px", marginBottom: "8px", flexWrap: "wrap" };
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#0f0d0a", color: "#e8dcc8", fontFamily: "'DM Sans', sans-serif" }}>
+
+          {/* HEADER */}
+          <div style={{ background: "linear-gradient(180deg, #1a1510 0%, #0f0d0a 100%)", borderBottom: "1px solid #2a2320", padding: "28px 0 20px", textAlign: "center" }}>
+            <div style={{ fontSize: "10px", fontWeight: 800, letterSpacing: "0.3em", color: "#c4913a", marginBottom: "6px" }}>COOPERSTOWN PROJECTION SYSTEM</div>
+            <h1 style={{ fontSize: "clamp(28px, 5vw, 40px)", fontWeight: 900, fontFamily: "'Playfair Display', serif", color: "#e8dcc8", margin: 0, letterSpacing: "-0.02em", lineHeight: 1.1 }}>Hall of Fame Calculator</h1>
+            <div style={{ fontSize: "12px", color: "#6b5c4a", marginTop: "8px" }}>Built on Baseball-Reference benchmarks, JAWS, and historical milestone data</div>
+          </div>
+
+          <div style={{ maxWidth: "680px", margin: "0 auto", padding: "20px 16px 60px" }} key={resetKey}>
+
+            {/* PRESETS */}
+            <div style={{ marginBottom: "20px" }}>
+              <div style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.1em", color: "#6b5c4a", marginBottom: "8px", textTransform: "uppercase" }}>Quick Load Active Players</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                {Object.keys(PRESETS).map(name => (
+                  <button key={name} onClick={() => loadPreset(name)} style={{
+                    padding: "5px 12px", borderRadius: "100px", cursor: "pointer", transition: "all 0.2s", fontSize: "12px", fontWeight: 600, fontFamily: "'DM Sans', sans-serif",
+                    border: playerName === name ? "1px solid #c4913a" : "1px solid #2a2320",
+                    background: playerName === name ? "rgba(196,145,58,0.12)" : "#1a1612",
+                    color: playerName === name ? "#c4913a" : "#8B7355",
+                  }}>{name}</button>
+                ))}
+              </div>
+            </div>
+
+            {/* TYPE TOGGLE */}
+            <div style={{ display: "flex", gap: "2px", background: "#1a1612", borderRadius: "10px", padding: "3px", marginBottom: "16px", border: "1px solid #2a2320" }}>
+              {["batter", "pitcher"].map(t => (
+                <button key={t} onClick={() => setPlayerType(t)} style={{
+                  flex: 1, padding: "10px", borderRadius: "8px", border: "none", fontWeight: 700, fontSize: "13px", letterSpacing: "0.06em", textTransform: "uppercase", cursor: "pointer", fontFamily: "'DM Sans', sans-serif", transition: "all 0.2s",
+                  background: playerType === t ? "#c4913a" : "transparent",
+                  color: playerType === t ? "#0f0d0a" : "#6b5c4a",
+                }}>{t === "batter" ? "Position Player" : "Pitcher"}</button>
+              ))}
+            </div>
+
+            {/* NAME / POSITION / AGE */}
+            <div style={{ display: "flex", gap: "10px", marginBottom: "16px", flexWrap: "wrap" }}>
+              <div style={{ flex: "1 1 200px" }}>
+                <label style={{ display: "block", fontSize: "10px", fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "#8B7355", marginBottom: "6px" }}>Player Name</label>
+                <input type="text" value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="e.g. Juan Soto"
+                  style={{ width: "100%", padding: "8px 10px", background: "#1a1612", border: "1px solid #3d3228", borderRadius: "6px", color: "#e8dcc8", fontSize: "15px", fontFamily: "'IBM Plex Mono', monospace", fontWeight: 500, outline: "none", boxSizing: "border-box" }} />
+              </div>
+              <div style={{ flex: "0 0 auto" }}>
+                <label style={{ display: "block", fontSize: "10px", fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "#8B7355", marginBottom: "6px" }}>Position</label>
+                <div style={{ display: "flex", gap: "3px", flexWrap: "wrap" }}>
+                  {positions.map(p => (
+                    <button key={p} onClick={() => setPosition(p)} style={{
+                      padding: "7px 10px", borderRadius: "6px", fontSize: "12px", fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", cursor: "pointer", transition: "all 0.15s", minWidth: "36px", textAlign: "center",
+                      border: position === p ? "1px solid #c4913a" : "1px solid #2a2320",
+                      background: position === p ? "rgba(196,145,58,0.15)" : "#1a1612",
+                      color: position === p ? "#c4913a" : "#6b5c4a",
+                    }}>{p}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{ flex: "0 0 80px" }}>
+                <StatInput label="Age" name="age" value={currentAge} onChange={e => { const v = parseInt(e.target.value) || 20; setCurrentAge(v); if (projectionAge < v) setProjectionAge(v); }} placeholder="28" />
+              </div>
+            </div>
+
+            {/* COUNTING STATS */}
+            <div style={sectionStyle}>
+              <div style={sectionTitle()}>{isPitcher ? "\u26BE Pitching Stats" : "\u26BE Career Counting Stats"}</div>
+              {!isPitcher ? (<>
+                <div style={rowStyle}>
+                  <StatInput small label="Hits" name="hits" value={stats.hits} onChange={handleStatChange} placeholder="1578" />
+                  <StatInput small label="Home Runs" name="hr" value={stats.hr} onChange={handleStatChange} placeholder="378" />
+                  <StatInput small label="RBI" name="rbi" value={stats.rbi} onChange={handleStatChange} placeholder="940" />
+                  <StatInput small label="Runs" name="runs" value={stats.runs} onChange={handleStatChange} placeholder="1052" />
+                </div>
+                <div style={rowStyle}>
+                  <StatInput small label="SB" name="sb" value={stats.sb} onChange={handleStatChange} placeholder="213" />
+                  <StatInput small label="AVG" name="avg" value={stats.avg} onChange={handleStatChange} placeholder=".276" />
+                  <StatInput small label="OPS+" name="opsPlus" value={stats.opsPlus} onChange={handleStatChange} placeholder="171" />
+                </div>
+              </>) : (<>
+                <div style={rowStyle}>
+                  <StatInput small label="Wins" name="wins" value={stats.wins} onChange={handleStatChange} placeholder="148" />
+                  <StatInput small label="Strikeouts" name="k" value={stats.k} onChange={handleStatChange} placeholder="2199" />
+                  <StatInput small label="Saves" name="saves" value={stats.saves} onChange={handleStatChange} placeholder="0" />
+                  <StatInput small label="IP" name="ip" value={stats.ip} onChange={handleStatChange} placeholder="1870" />
+                </div>
+                <div style={rowStyle}>
+                  <StatInput small label="ERA+" name="eraPlus" value={stats.eraPlus} onChange={handleStatChange} placeholder="135" />
+                </div>
+              </>)}
+            </div>
+
+            {/* WAR */}
+            <div style={sectionStyle}>
+              <div style={sectionTitle()}>{"\uD83D\uDCCA"} WAR & Advanced</div>
+              <div style={rowStyle}>
+                <StatInput small label="Career bWAR" name="war" value={stats.war} onChange={handleStatChange} placeholder="85.2" />
+                <StatInput small label="Peak 7yr WAR" name="peak7war" value={stats.peak7war} onChange={handleStatChange} placeholder="57.5" />
+              </div>
+            </div>
+
+            {/* AWARDS */}
+            <div style={{...sectionStyle, marginBottom: "20px"}}>
+              <div style={sectionTitle()}>{"\uD83C\uDFC6"} Awards & Honors</div>
+              <div style={rowStyle}>
+                <StatInput small label="All-Star Games" name="allstar" value={stats.allstar} onChange={handleStatChange} placeholder="11" />
+                {!isPitcher ? (<>
+                  <StatInput small label="MVPs" name="mvp" value={stats.mvp} onChange={handleStatChange} placeholder="3" />
+                  <StatInput small label="Gold Gloves" name="goldGlove" value={stats.goldGlove} onChange={handleStatChange} placeholder="0" />
+                </>) : (
+                  <StatInput small label="Cy Youngs" name="cyYoung" value={stats.cyYoung} onChange={handleStatChange} placeholder="1" />
+                )}
+              </div>
+            </div>
+
+            {/* RESULTS */}
+            {result && (
+              <div style={{ background: "linear-gradient(135deg, #1a1612 0%, #14110e 100%)", border: "1px solid #2a2320", borderRadius: "16px", padding: "24px", marginBottom: "20px", textAlign: "center" }}>
+                {playerName && <div style={{ fontSize: "22px", fontWeight: 800, fontFamily: "'Playfair Display', serif", color: "#e8dcc8", marginBottom: "4px" }}>{playerName}</div>}
+                <div style={{ fontSize: "11px", color: "#6b5c4a", fontWeight: 600, letterSpacing: "0.08em", marginBottom: "16px" }}>
+                  {(POSITION_JAWS[position] || {}).label || position}
+                  {showProjection && projectionAge > currentAge && <span style={{ color: "#c4913a" }}> {"\u2022"} Projected to age {projectionAge}</span>}
+                </div>
+                <div style={{ display: "flex", justifyContent: "center", marginBottom: "16px" }}><GaugeRing probability={result.probability} /></div>
+                {result.milestoneHits.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "6px", justifyContent: "center", marginTop: "12px" }}>
+                    {result.milestoneHits.map((m, i) => <MilestoneChip key={i} {...m} />)}
+                  </div>
+                )}
+                {showProjection && projectionAge > currentAge && (
+                  <div style={{ marginTop: "16px", padding: "12px", background: "#0f0d0a", borderRadius: "10px", border: "1px solid #2a2320" }}>
+                    <div style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.1em", color: "#6b5c4a", marginBottom: "8px", textTransform: "uppercase" }}>Projected Stats at Age {projectionAge}</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", justifyContent: "center" }}>
+                      {!isPitcher ? (<>
+                        {activeStats.war && <StatChip label="WAR" value={activeStats.war} />}
+                        {activeStats.hits && <StatChip label="H" value={Number(activeStats.hits).toLocaleString()} />}
+                        {activeStats.hr && <StatChip label="HR" value={Number(activeStats.hr).toLocaleString()} />}
+                        {activeStats.rbi && <StatChip label="RBI" value={Number(activeStats.rbi).toLocaleString()} />}
+                      </>) : (<>
+                        {activeStats.war && <StatChip label="WAR" value={activeStats.war} />}
+                        {activeStats.wins && <StatChip label="W" value={Number(activeStats.wins).toLocaleString()} />}
+                        {activeStats.k && <StatChip label="K" value={Number(activeStats.k).toLocaleString()} />}
+                      </>)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* PROJECTION */}
+            <div style={sectionStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+                <div style={sectionTitle()}>{"\uD83D\uDD2E"} Career Projection</div>
+                <button onClick={() => setShowProjection(!showProjection)} style={{
+                  padding: "4px 12px", borderRadius: "100px", fontSize: "11px", fontWeight: 700, fontFamily: "'DM Sans', sans-serif", cursor: "pointer",
+                  border: showProjection ? "1px solid #c4913a" : "1px solid #3d3228",
+                  background: showProjection ? "rgba(196,145,58,0.15)" : "transparent",
+                  color: showProjection ? "#c4913a" : "#6b5c4a",
+                }}>{showProjection ? "ON" : "OFF"}</button>
+              </div>
+              {showProjection && (<>
+                <div style={{ marginBottom: "14px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "6px" }}>
+                    <span style={{ fontSize: "11px", color: "#8B7355", fontWeight: 600 }}>Project to Age</span>
+                    <span style={{ fontSize: "22px", fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: "#e8dcc8" }}>{projectionAge}</span>
+                  </div>
+                  <input type="range" min={currentAge} max={42} value={projectionAge} onChange={e => setProjectionAge(parseInt(e.target.value))} style={rangeStyle(projectionAge, currentAge, 42)} />
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "#4a3f33", marginTop: "2px", fontFamily: "'IBM Plex Mono', monospace" }}>
+                    <span>{currentAge}</span><span>42</span>
+                  </div>
+                </div>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "6px" }}>
+                    <span style={{ fontSize: "11px", color: "#8B7355", fontWeight: 600 }}>Performance Level</span>
+                    <span style={{ fontSize: "14px", fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: performanceMult >= 1.1 ? "#4CAF50" : performanceMult <= 0.7 ? "#c0392b" : "#e8dcc8" }}>{(performanceMult * 100).toFixed(0)}%</span>
+                  </div>
+                  <input type="range" min={50} max={130} value={performanceMult * 100} onChange={e => setPerformanceMult(parseInt(e.target.value) / 100)} style={rangeStyle(performanceMult * 100, 50, 130)} />
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "#4a3f33", marginTop: "2px", fontFamily: "'DM Sans', sans-serif" }}>
+                    <span>Injury decline</span><span>Normal aging</span><span>Elite health</span>
+                  </div>
+                </div>
+              </>)}
+            </div>
+
+            {/* RESET */}
+            <button onClick={resetAll} style={{
+              width: "100%", padding: "12px", borderRadius: "10px", border: "1px solid #2a2320", background: "#14110e", color: "#6b5c4a",
+              fontSize: "12px", fontWeight: 700, fontFamily: "'DM Sans', sans-serif", letterSpacing: "0.06em", textTransform: "uppercase", cursor: "pointer",
+            }}>Clear All & Reset</button>
+
+            {/* METHODOLOGY */}
+            <div style={{ marginTop: "24px", padding: "14px", background: "#14110e", borderRadius: "10px", border: "1px solid #1e1a16" }}>
+              <div style={{ fontSize: "10px", fontWeight: 700, letterSpacing: "0.1em", color: "#4a3f33", marginBottom: "6px", textTransform: "uppercase" }}>Methodology</div>
+              <div style={{ fontSize: "11px", color: "#5a4e3e", lineHeight: 1.6 }}>
+                Probability is calculated using a weighted composite of traditional HOF milestones (3,000 H, 500 HR, 300 W, 3,000 K), modern advanced metrics (career bWAR, JAWS position averages, OPS+/ERA+), and awards. Projections use historical aging curves derived from Baseball-Reference data. The performance slider adjusts projected decline rate from accelerated (injury) to decelerated (elite health). This is an estimation tool — actual HOF voting involves subjective factors including narrative, postseason performance, and PED considerations.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
