@@ -30,9 +30,6 @@ input[type="range"]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;b
 const{useState,useCallback,useMemo,useEffect,useRef}=React;
 const LAHMAN_BASE="https://cdn.jsdelivr.net/gh/chadwickbureau/baseballdatabank@master/core";
 let lahmanCache=null;
-let appearanceCache=null;
-let awardsCache=null;
-let lahmanLoadPromise=null;
 const playerStatsCache={batting:{},pitching:{}};
 
 /* ═══════════════════════════════════════════
@@ -67,65 +64,31 @@ function toInnings(ipouts){
 
 async function loadLahman(){
   if(lahmanCache)return lahmanCache;
-  if(lahmanLoadPromise)return lahmanLoadPromise;
-  lahmanLoadPromise=(async()=>{
-    const peopleCsv=await fetch(`${LAHMAN_BASE}/People.csv`).then(r=>r.text());
-    const people=csvParse(peopleCsv);
-    const peopleById={},peopleList=[];
-    for(const p of people){
-      const name=[p.nameFirst,p.nameLast].filter(Boolean).join(" ").trim();if(!name)continue;
-      const row={
-        id:p.playerID,name,searchName:name.toLowerCase(),birthYear:parseInt(p.birthYear||0,10)||null,
-        debutYear:p.debut?parseInt(p.debut.substring(0,4),10):null,
-        finalYear:p.finalGame?parseInt(p.finalGame.substring(0,4),10):null
-      };
-      peopleById[p.playerID]=row;
-      peopleList.push(row);
-    }
-    lahmanCache={peopleById,peopleList};
-    return lahmanCache;
-  })();
-  try{return await lahmanLoadPromise}
-  finally{lahmanLoadPromise=null}
-}
+  const [peopleCsv,appsCsv]=await Promise.all([
+    fetch(`${LAHMAN_BASE}/People.csv`).then(r=>r.text()),
+    fetch(`${LAHMAN_BASE}/Appearances.csv`).then(r=>r.text())
+  ]);
+  const people=csvParse(peopleCsv),apps=csvParse(appsCsv);
 
-async function loadAppearances(){
-  if(appearanceCache)return appearanceCache;
-  const appsCsv=await fetch(`${LAHMAN_BASE}/Appearances.csv`).then(r=>r.text());
-  const apps=csvParse(appsCsv),appByPlayer={};
+  const peopleById={},appByPlayer={};
+  for(const p of people){
+    const name=[p.nameFirst,p.nameLast].filter(Boolean).join(" ").trim();if(!name)continue;
+    peopleById[p.playerID]={
+      id:p.playerID,name,birthYear:parseInt(p.birthYear||0,10)||null,
+      debutYear:p.debut?parseInt(p.debut.substring(0,4),10):null,
+      finalYear:p.finalGame?parseInt(p.finalGame.substring(0,4),10):null
+    };
+  }
   for(const a of apps){
     if(!appByPlayer[a.playerID])appByPlayer[a.playerID]={P:0,C:0,"1B":0,"2B":0,"3B":0,SS:0,LF:0,CF:0,RF:0,DH:0};
-    const st=appByPlayer[a.playerID];
-    st.P+=parseInt(a.G_p||0,10);st.C+=parseInt(a.G_c||0,10);st["1B"]+=parseInt(a.G_1b||0,10);st["2B"]+=parseInt(a.G_2b||0,10);
-    st["3B"]+=parseInt(a.G_3b||0,10);st.SS+=parseInt(a.G_ss||0,10);st.LF+=parseInt(a.G_lf||0,10);st.CF+=parseInt(a.G_cf||0,10);
-    st.RF+=parseInt(a.G_rf||0,10);st.DH+=parseInt(a.G_dh||0,10);
+    const s=appByPlayer[a.playerID];
+    s.P+=parseInt(a.G_p||0,10);s.C+=parseInt(a.G_c||0,10);s["1B"]+=parseInt(a.G_1b||0,10);s["2B"]+=parseInt(a.G_2b||0,10);
+    s["3B"]+=parseInt(a.G_3b||0,10);s.SS+=parseInt(a.G_ss||0,10);s.LF+=parseInt(a.G_lf||0,10);s.CF+=parseInt(a.G_cf||0,10);
+    s.RF+=parseInt(a.G_rf||0,10);s.DH+=parseInt(a.G_dh||0,10);
   }
-  appearanceCache=appByPlayer;
-  return appearanceCache;
-}
 
-async function loadAwards(){
-  if(awardsCache)return awardsCache;
-  const awardsCsv=await fetch(`${LAHMAN_BASE}/AwardsPlayers.csv`).then(r=>r.text());
-  const awards=csvParse(awardsCsv),byPlayer={};
-  for(const a of awards){
-    const pid=a.playerID;if(!pid)continue;
-    if(!byPlayer[pid])byPlayer[pid]={allstar:new Set(),mvp:new Set(),goldGlove:new Set(),cyYoung:new Set()};
-    const id=(a.awardID||"").toLowerCase();
-    const year=a.yearID||"";
-    if(id.includes("all-star"))byPlayer[pid].allstar.add(year);
-    if(id.includes("most valuable player"))byPlayer[pid].mvp.add(year);
-    if(id.includes("gold glove"))byPlayer[pid].goldGlove.add(year);
-    if(id.includes("cy young"))byPlayer[pid].cyYoung.add(year);
-  }
-  awardsCache=byPlayer;
-  return awardsCache;
-}
-
-async function fetchAwards(pid){
-  const data=await loadAwards();
-  const a=data[pid];if(!a)return{allstar:"",mvp:"",goldGlove:"",cyYoung:""};
-  return{allstar:String(a.allstar.size||0),mvp:String(a.mvp.size||0),goldGlove:String(a.goldGlove.size||0),cyYoung:String(a.cyYoung.size||0)};
+  lahmanCache={peopleById,appByPlayer};
+  return lahmanCache;
 }
 
 async function loadPlayerYearlyStats(playerId,isPitcher){
@@ -156,23 +119,26 @@ async function searchPlayers(query){
   try{
     const d=await loadLahman();
     const nowYear=new Date().getFullYear();
-    const q=query.toLowerCase().trim();
-    return d.peopleList
-      .filter(p=>p.searchName.includes(q))
+    return Object.values(d.peopleById)
+      .filter(p=>p.name.toLowerCase().includes(query.toLowerCase()))
       .sort((a,b)=>(b.finalYear||0)-(a.finalYear||0))
       .slice(0,10)
-      .map(p=>({id:p.id,name:p.name,pos:"?",currentAge:p.birthYear?nowYear-p.birthYear:null,active:(p.finalYear||0)>=nowYear-1,isPitcher:false,team:""}));
+      .map(p=>{
+        const pos=mapPos(topPos(d.appByPlayer[p.id]||{}));
+        const age=p.birthYear?nowYear-p.birthYear:null;
+        const hasPitching=(d.appByPlayer[p.id]?.P||0)>0;
+        return{id:p.id,name:p.name,pos,currentAge:age,active:(p.finalYear||0)>=nowYear-1,isPitcher:hasPitching,team:""};
+      });
   }catch(e){console.warn("Lahman search error:",e);return[]}
 }
 
 async function fetchPerson(pid){
   try{
-    const[d,apps]=await Promise.all([loadLahman(),loadAppearances()]);
-    const p=d.peopleById[pid];if(!p)return null;
+    const d=await loadLahman();const p=d.peopleById[pid];if(!p)return null;
     const nowYear=new Date().getFullYear();
-    const pos=topPos(apps[pid]||{});
+    const pos=topPos(d.appByPlayer[pid]||{});
     return{id:p.id,name:p.name,pos,birthDate:p.birthYear?`${p.birthYear}-01-01`:null,currentAge:p.birthYear?nowYear-p.birthYear:null,
-      active:(p.finalYear||0)>=nowYear-1,isPitcher:(apps[pid]?.P||0)>0,debutYear:p.debutYear};
+      active:(p.finalYear||0)>=nowYear-1,isPitcher:(d.appByPlayer[pid]?.P||0)>0,debutYear:p.debutYear};
   }catch(e){return null}
 }
 
@@ -370,9 +336,8 @@ function App(){
       if(data){
         setCache(data);
         const parsed=ispit?parsePitching(data.career):parseHitting(data.career);
-        const awards=await fetchAwards(p.id);
-        setStats({...E,...parsed,...awards});
-        setAgeNote("Stats + awards loaded from Lahman Database");
+        setStats({...E,...parsed});
+        setAgeNote("Stats loaded from Lahman Database");
       }else{
         setAgeNote("Could not load stats \u2014 enter manually");
       }
@@ -518,7 +483,7 @@ function App(){
           <div style={{fontSize:"10px",fontWeight:700,letterSpacing:".1em",color:"#4a3f33",marginBottom:"6px",textTransform:"uppercase"}}>How It Works</div>
           <div style={{fontSize:"11px",color:"#5a4e3e",lineHeight:1.6}}>
             <b style={{color:"#8B7355"}}>Auto-filled:</b> Counting stats (H, HR, RBI, W, K, etc.), position, and age loaded from the Lahman Database. Change the age to see actual year-by-year stats through that season.
-            <br/><br/><b style={{color:"#e67e22"}}>Manual:</b> WAR, Peak WAR, OPS+, ERA+ still manual (not in core Lahman). Awards now auto-fill.
+            <br/><br/><b style={{color:"#e67e22"}}>Manual:</b> WAR, Peak WAR, OPS+, ERA+, awards — look these up on <b>baseball-reference.com</b>.
             <br/><br/><b style={{color:"#8B7355"}}>Model:</b> Weighted milestones + JAWS + aging curves for projections.
           </div>
         </div>
