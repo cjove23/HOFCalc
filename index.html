@@ -11,6 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body,#root{height:100%;width:100%}
@@ -28,78 +29,203 @@ input[type="range"]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;b
 <div id="root"></div>
 <script type="text/babel">
 const{useState,useCallback,useMemo,useEffect,useRef}=React;
-const API="https://statsapi.mlb.com/api/v1";
+const SQL_JS_WASM="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.wasm";
+const SQL_SOURCE_URLS=(window.HOF_LAHMAN_SQL_URLS&&Array.isArray(window.HOF_LAHMAN_SQL_URLS)?window.HOF_LAHMAN_SQL_URLS:[])
+  .concat(window.HOF_LAHMAN_SQL_URL?[window.HOF_LAHMAN_SQL_URL]:[])
+  .concat([
+    "https://sabr.app.box.com/shared/static/lahman.sqlite",
+    "https://sabr.app.box.com/shared/static/baseballdatabank.sqlite"
+  ]);
+let sqlModulePromise=null;
+let sqlDb=null;
+let sqlDbPromise=null;
+let lastLoadError="";
 
 /* ═══════════════════════════════════════════
-   MLB STATS API — search, person, stats
-   Three search strategies with fallbacks
+   LAHMAN DATABASE — search, person, stats
    ═══════════════════════════════════════════ */
+
+function normalizeSqlRows(result){
+  if(!result||!result.columns||!result.values)return[];
+  return result.values.map(v=>Object.fromEntries(result.columns.map((c,i)=>[c,v[i]])));
+}
+
+async function loadSqlModule(){
+  if(sqlModulePromise)return sqlModulePromise;
+  if(typeof window.initSqlJs!=="function")throw new Error("sql.js failed to load from CDN");
+  sqlModulePromise=window.initSqlJs({locateFile:()=>SQL_JS_WASM});
+  return sqlModulePromise;
+}
+
+async function fetchArrayBuffer(url){
+  const resp=await fetch(url);
+  if(!resp.ok)throw new Error(`HTTP ${resp.status}`);
+  return await resp.arrayBuffer();
+}
+
+async function loadSqlDatabase(){
+  if(sqlDb)return sqlDb;
+  if(sqlDbPromise)return sqlDbPromise;
+  sqlDbPromise=(async()=>{
+    const SQL=await loadSqlModule();
+    const errs=[];
+    for(const url of SQL_SOURCE_URLS){
+      try{
+        const buf=await fetchArrayBuffer(url);
+        sqlDb=new SQL.Database(new Uint8Array(buf));
+        lastLoadError="";
+        return sqlDb;
+      }catch(e){errs.push(`${url} (${e?.message||"load failed"})`)}
+    }
+    lastLoadError=errs.join("; ");
+    throw new Error(`Unable to load Lahman SQL DB from configured URLs. ${lastLoadError}`);
+  })();
+  try{return await sqlDbPromise}
+  finally{sqlDbPromise=null}
+}
+
+async function importSqlDatabaseFromFile(file){
+  if(!file)return;
+  const SQL=await loadSqlModule();
+  const bytes=new Uint8Array(await file.arrayBuffer());
+  sqlDb=new SQL.Database(bytes);
+  lastLoadError="";
+}
+
+async function queryAll(sql,params={}){
+  const db=await loadSqlDatabase();
+  const out=db.exec(sql,params);
+  if(!out.length)return[];
+  return normalizeSqlRows(out[0]);
+}
+
+async function queryOne(sql,params={}){
+  const rows=await queryAll(sql,params);
+  return rows[0]||null;
+}
+
+function toInnings(ipouts){
+  const outs=parseInt(ipouts||0,10);if(!outs)return"0.0";
+  const whole=Math.floor(outs/3),rem=outs%3;
+  return `${whole}.${rem}`;
+}
+
+async function fetchAwards(pid){
+  const r=await queryOne(`
+    SELECT
+      COUNT(DISTINCT CASE WHEN lower(awardID) LIKE '%all-star%' THEN yearID END) AS allstar,
+      COUNT(DISTINCT CASE WHEN lower(awardID) LIKE '%most valuable player%' THEN yearID END) AS mvp,
+      COUNT(DISTINCT CASE WHEN lower(awardID) LIKE '%gold glove%' THEN yearID END) AS goldGlove,
+      COUNT(DISTINCT CASE WHEN lower(awardID) LIKE '%cy young%' THEN yearID END) AS cyYoung
+    FROM AwardsPlayers
+    WHERE playerID = $pid
+  `,{$pid:pid});
+  if(!r)return{allstar:"",mvp:"",goldGlove:"",cyYoung:""};
+  return{allstar:String(r.allstar||0),mvp:String(r.mvp||0),goldGlove:String(r.goldGlove||0),cyYoung:String(r.cyYoung||0)};
+}
 
 async function searchPlayers(query){
   if(!query||query.length<2)return[];
-
-  // 1) statsapi /people/search
   try{
-    const r=await fetch(API+"/people/search?names="+encodeURIComponent(query)+"&hydrate=currentTeam&limit=10");
-    if(r.ok){const d=await r.json();if(d.people?.length)return d.people.slice(0,10).map(p=>({
-      id:p.id,name:p.fullName,pos:p.primaryPosition?.abbreviation||"?",
-      currentAge:p.currentAge,active:p.active,
-      isPitcher:p.primaryPosition?.code==="1",team:p.currentTeam?.abbreviation||""
-    }))}
-  }catch(e){console.log("search strategy 1:",e.message)}
-
-  // 2) lookup-service-prod
-  try{
-    const r=await fetch("https://lookup-service-prod.mlb.com/json/named.search_player_all.bam?sport_code=%27mlb%27&name_part=%27"+encodeURIComponent(query)+"%25%27");
-    if(r.ok){const d=await r.json();const rows=d?.search_player_all?.queryResults?.row;if(rows){
-      const arr=Array.isArray(rows)?rows:[rows];
-      return arr.slice(0,10).map(p=>({
-        id:parseInt(p.player_id),name:p.name_display_first_last,pos:p.position||"?",
-        currentAge:null,active:p.active_sw==="Y",isPitcher:p.position==="P",team:p.team_abbrev||""
-      }))}}
-  }catch(e){console.log("search strategy 2:",e.message)}
-
-  // 3) suggest service
-  try{
-    const r=await fetch("https://suggest.mlb.com/svc/suggest/v1/min_all/"+encodeURIComponent(query)+"/10");
-    if(r.ok){const d=await r.json();if(d.suggestions?.length)return d.suggestions.filter(s=>s).map(s=>{
-      const p=s.split("|");return{id:parseInt(p[2]||0),name:p[1]||s,pos:"?",currentAge:null,active:true,isPitcher:false,team:""}
-    }).filter(p=>p.id>0)}
-  }catch(e){console.log("search strategy 3:",e.message)}
-
-  return[];
+    const nowYear=new Date().getFullYear();
+    const q=`%${query.toLowerCase().trim()}%`;
+    const rows=await queryAll(`
+      SELECT
+        playerID AS id,
+        trim(coalesce(nameFirst,'') || ' ' || coalesce(nameLast,'')) AS name,
+        CAST(NULLIF(birthYear,'') AS INTEGER) AS birthYear,
+        CAST(substr(finalGame,1,4) AS INTEGER) AS finalYear
+      FROM People
+      WHERE lower(trim(coalesce(nameFirst,'') || ' ' || coalesce(nameLast,''))) LIKE $q
+      ORDER BY finalYear DESC, name ASC
+      LIMIT 10
+    `,{$q:q});
+    return rows.filter(r=>r.name).map(r=>({
+      id:r.id,name:r.name,pos:"?",currentAge:r.birthYear?nowYear-r.birthYear:null,
+      active:(r.finalYear||0)>=nowYear-1,isPitcher:false,team:""
+    }));
+  }catch(e){console.warn("Lahman search error:",e);return[]}
 }
 
-// Always fetch person details after selecting — gives correct position, age, birth date
 async function fetchPerson(pid){
   try{
-    const r=await fetch(API+"/people/"+pid);if(!r.ok)return null;
-    const d=await r.json();const p=d?.people?.[0];if(!p)return null;
-    return{id:p.id,name:p.fullName,pos:p.primaryPosition?.abbreviation||"?",
-      posCode:p.primaryPosition?.code||"",birthDate:p.birthDate,
-      currentAge:p.currentAge,active:p.active,
-      isPitcher:p.primaryPosition?.code==="1",
-      debutYear:p.mlbDebutDate?parseInt(p.mlbDebutDate.substring(0,4)):null};
+    const p=await queryOne(`
+      SELECT
+        playerID,
+        trim(coalesce(nameFirst,'') || ' ' || coalesce(nameLast,'')) AS name,
+        CAST(NULLIF(birthYear,'') AS INTEGER) AS birthYear,
+        CAST(substr(debut,1,4) AS INTEGER) AS debutYear,
+        CAST(substr(finalGame,1,4) AS INTEGER) AS finalYear
+      FROM People WHERE playerID = $pid LIMIT 1
+    `,{$pid:pid});
+    if(!p)return null;
+    const app=await queryOne(`
+      SELECT
+        COALESCE(SUM(CAST(NULLIF(G_p,'') AS INTEGER)),0) AS P,
+        COALESCE(SUM(CAST(NULLIF(G_c,'') AS INTEGER)),0) AS C,
+        COALESCE(SUM(CAST(NULLIF(G_1b,'') AS INTEGER)),0) AS [1B],
+        COALESCE(SUM(CAST(NULLIF(G_2b,'') AS INTEGER)),0) AS [2B],
+        COALESCE(SUM(CAST(NULLIF(G_3b,'') AS INTEGER)),0) AS [3B],
+        COALESCE(SUM(CAST(NULLIF(G_ss,'') AS INTEGER)),0) AS SS,
+        COALESCE(SUM(CAST(NULLIF(G_lf,'') AS INTEGER)),0) AS LF,
+        COALESCE(SUM(CAST(NULLIF(G_cf,'') AS INTEGER)),0) AS CF,
+        COALESCE(SUM(CAST(NULLIF(G_rf,'') AS INTEGER)),0) AS RF,
+        COALESCE(SUM(CAST(NULLIF(G_dh,'') AS INTEGER)),0) AS DH
+      FROM Appearances
+      WHERE playerID = $pid
+    `,{$pid:pid})||{};
+    const nowYear=new Date().getFullYear();
+    const pos=topPos(app);
+    return{id:p.playerID,name:p.name,pos,birthDate:p.birthYear?`${p.birthYear}-01-01`:null,currentAge:p.birthYear?nowYear-p.birthYear:null,
+      active:(p.finalYear||0)>=nowYear-1,isPitcher:(app.P||0)>0,debutYear:p.debutYear};
   }catch(e){return null}
 }
 
 async function fetchStats(pid,isPitcher){
-  const g=isPitcher?"pitching":"hitting";
   try{
-    const[cr,yr]=await Promise.all([
-      fetch(API+"/people/"+pid+"/stats?stats=career&group="+g),
-      fetch(API+"/people/"+pid+"/stats?stats=yearByYear&group="+g+"&sportId=1")
-    ]);
-    const cd=await cr.json(),yd=await yr.json();
-    return{
-      career:cd?.stats?.[0]?.splits?.[0]?.stat||{},
-      yearByYear:(yd?.stats?.[0]?.splits||[]).map(s=>({season:parseInt(s.season),stat:s.stat})).sort((a,b)=>a.season-b.season)
-    };
+    const rows=await queryAll(isPitcher?`
+      SELECT
+        CAST(yearID AS INTEGER) AS season,
+        COALESCE(SUM(CAST(NULLIF(W,'') AS INTEGER)),0) AS wins,
+        COALESCE(SUM(CAST(NULLIF(SO,'') AS INTEGER)),0) AS strikeOuts,
+        COALESCE(SUM(CAST(NULLIF(SV,'') AS INTEGER)),0) AS saves,
+        COALESCE(SUM(CAST(NULLIF(IPouts,'') AS INTEGER)),0)/3.0 AS inningsPitched,
+        COALESCE(SUM(CAST(NULLIF(G,'') AS INTEGER)),0) AS gamesPlayed
+      FROM Pitching
+      WHERE playerID = $pid
+      GROUP BY yearID ORDER BY season ASC
+    `:`
+      SELECT
+        CAST(yearID AS INTEGER) AS season,
+        COALESCE(SUM(CAST(NULLIF(H,'') AS INTEGER)),0) AS hits,
+        COALESCE(SUM(CAST(NULLIF(HR,'') AS INTEGER)),0) AS homeRuns,
+        COALESCE(SUM(CAST(NULLIF(RBI,'') AS INTEGER)),0) AS rbi,
+        COALESCE(SUM(CAST(NULLIF(R,'') AS INTEGER)),0) AS runs,
+        COALESCE(SUM(CAST(NULLIF(SB,'') AS INTEGER)),0) AS stolenBases,
+        COALESCE(SUM(CAST(NULLIF(AB,'') AS INTEGER)),0) AS atBats,
+        COALESCE(SUM(CAST(NULLIF(G,'') AS INTEGER)),0) AS gamesPlayed
+      FROM Batting
+      WHERE playerID = $pid
+      GROUP BY yearID ORDER BY season ASC
+    `,{$pid:pid});
+    const sorted=rows.map(r=>({season:r.season,stat:isPitcher?{
+      wins:r.wins||0,strikeOuts:r.strikeOuts||0,saves:r.saves||0,inningsPitched:r.inningsPitched||0,gamesPlayed:r.gamesPlayed||0
+    }:{
+      hits:r.hits||0,homeRuns:r.homeRuns||0,rbi:r.rbi||0,runs:r.runs||0,stolenBases:r.stolenBases||0,atBats:r.atBats||0,gamesPlayed:r.gamesPlayed||0
+    }}));
+    const career=sorted.reduce((acc,s)=>{
+      Object.keys(s.stat).forEach(k=>acc[k]=(acc[k]||0)+(s.stat[k]||0));
+      return acc;
+    },{});
+    return{career,yearByYear:sorted};
   }catch(e){console.warn("Stats error:",e);return null}
 }
 
-function parseHitting(s){return{hits:s.hits!=null?String(s.hits):"",hr:s.homeRuns!=null?String(s.homeRuns):"",rbi:s.rbi!=null?String(s.rbi):"",runs:s.runs!=null?String(s.runs):"",sb:s.stolenBases!=null?String(s.stolenBases):"",avg:s.avg||""}}
-function parsePitching(s){return{wins:s.wins!=null?String(s.wins):"",k:s.strikeOuts!=null?String(s.strikeOuts):"",saves:s.saves!=null?String(s.saves):"",ip:s.inningsPitched||""}}
+function parseHitting(s){
+  let avg="";if((s.atBats||0)>0){avg=(s.hits/s.atBats).toFixed(3);if(avg[0]==="0")avg=avg.substring(1)}
+  return{hits:s.hits!=null?String(s.hits):"",hr:s.homeRuns!=null?String(s.homeRuns):"",rbi:s.rbi!=null?String(s.rbi):"",runs:s.runs!=null?String(s.runs):"",sb:s.stolenBases!=null?String(s.stolenBases):"",avg};
+}
+function parsePitching(s){return{wins:s.wins!=null?String(s.wins):"",k:s.strikeOuts!=null?String(s.strikeOuts):"",saves:s.saves!=null?String(s.saves):"",ip:toInnings(Math.round((s.inningsPitched||0)*3))}}
 
 function sumToAge(yby,birthYear,age,isP){
   const maxYear=birthYear+age;
@@ -114,11 +240,16 @@ function sumToAge(yby,birthYear,age,isP){
   return sum;
 }
 function parseSumH(s){return{hits:String(s.hits||0),hr:String(s.homeRuns||0),rbi:String(s.rbi||0),runs:String(s.runs||0),sb:String(s.stolenBases||0),avg:s.avg||""}}
-function parseSumP(s){return{wins:String(s.wins||0),k:String(s.strikeOuts||0),saves:String(s.saves||0),ip:String(Math.round(s.inningsPitched||0))}}
+function parseSumP(s){return{wins:String(s.wins||0),k:String(s.strikeOuts||0),saves:String(s.saves||0),ip:toInnings(Math.round((s.inningsPitched||0)*3))}}
 
-// Map MLB position abbreviation to our app's position codes
+function topPos(app){
+  const entries=Object.entries(app||{}).filter(([,v])=>v>0);if(!entries.length)return"DH";
+  return entries.sort((a,b)=>b[1]-a[1])[0][0];
+}
+
+// Map Lahman position code to our app's position codes
 function mapPos(pos){
-  const m={"P":"SP","TWP":"SP","LF":"LF","CF":"CF","RF":"RF","1B":"1B","2B":"2B","3B":"3B","SS":"SS","C":"C","DH":"DH","OF":"RF","IF":"SS"};
+  const m={"P":"SP","TWP":"SP","LF":"LF","CF":"CF","RF":"RF","1B":"1B","2B":"2B","3B":"3B","SS":"SS","C":"C","DH":"DH","OF":"RF","IF":"SS","PR":"RF","PH":"DH"};
   return m[pos]||"DH";
 }
 
@@ -244,6 +375,7 @@ function App(){
   const[loading,setLoading]=useState(false);
   const[cache,setCache]=useState(null);
   const[birthYear,setBirthYear]=useState(null);
+  const[dataSourceStatus,setDataSourceStatus]=useState("");
   const isP=playerType==="pitcher";
 
   const E={war:"",peak7war:"",hits:"",hr:"",rbi:"",avg:"",opsPlus:"",allstar:"",mvp:"",goldGlove:"",runs:"",sb:"",wins:"",k:"",eraPlus:"",cyYoung:"",saves:"",ip:""};
@@ -251,6 +383,21 @@ function App(){
   const hsc=useCallback(e=>{setStats(p=>({...p,[e.target.name]:e.target.value}));setSubmitted(false)},[]);
 
   const resetAll=()=>{setStats({...E});setPlayerName("");setPlayerType("batter");setPosition("SS");setCurrentAge("");setProjectionAge(28);setShowProjection(false);setPerformanceMult(1);setSubmitted(false);setSelPlayer(null);setAgeNote("");setCache(null);setBirthYear(null);setLoading(false);setResetKey(k=>k+1)};
+
+  const handleSqlFile=async(e)=>{
+    const file=e.target.files?.[0];
+    if(!file)return;
+    try{
+      await importSqlDatabaseFromFile(file);
+      setDataSourceStatus(`Loaded SQL database: ${file.name}`);
+      setAgeNote("Lahman SQL loaded from local file");
+    }catch(err){
+      setDataSourceStatus("Failed to load selected SQL file");
+      setAgeNote("Could not open SQL file — please choose a valid Lahman .sqlite DB");
+    }finally{
+      e.target.value="";
+    }
+  };
 
   // ── Player selected from dropdown ──
   const handlePlayerSelect=async(p)=>{
@@ -272,8 +419,9 @@ function App(){
       if(data){
         setCache(data);
         const parsed=ispit?parsePitching(data.career):parseHitting(data.career);
-        setStats({...E,...parsed});
-        setAgeNote("Stats loaded from MLB API");
+        const awards=await fetchAwards(p.id);
+        setStats({...E,...parsed,...awards});
+        setAgeNote("Stats + awards loaded from Lahman SQL Database");
       }else{
         setAgeNote("Could not load stats \u2014 enter manually");
       }
@@ -302,7 +450,7 @@ function App(){
       // Prior age — sum yearByYear
       const summed=sumToAge(cache.yearByYear,birthYear,age,isP);
       if(summed){const parsed=isP?parseSumP(summed):parseSumH(summed);setStats(prev=>({...prev,...parsed}));setAgeNote("Actual stats through age "+age+" season")}
-      else setAgeNote("No MLB data found for age "+age);
+      else setAgeNote("No Lahman SQL data found for age "+age);
     }
     if(parseInt(projectionAge)<age)setProjectionAge(age);
   };
@@ -318,6 +466,11 @@ function App(){
   const handleCalc=()=>{if(Object.values(stats).some(v=>v!==""))setSubmitted(true)};
   const bPos=["C","1B","2B","3B","SS","LF","CF","RF","DH"],pPos=["SP","RP"];
   const positions=isP?pPos:bPos;
+  useEffect(()=>{
+    loadSqlDatabase()
+      .then(()=>setDataSourceStatus("Connected to Lahman SQL source"))
+      .catch(()=>setDataSourceStatus("Could not auto-load SQL source. Upload Lahman .sqlite file below."));
+  },[]);
   useEffect(()=>{if(isP&&!pPos.includes(position))setPosition("SP");if(!isP&&!bPos.includes(position))setPosition("SS")},[isP]);
 
   const rs=(v,mn,mx)=>({width:"100%",height:"6px",WebkitAppearance:"none",appearance:"none",borderRadius:"3px",background:"linear-gradient(to right,#c4913a 0%,#c4913a "+((v-mn)/(mx-mn)*100)+"%,#2a2320 "+((v-mn)/(mx-mn)*100)+"%,#2a2320 100%)",outline:"none",cursor:"pointer"});
@@ -330,7 +483,7 @@ function App(){
       <div style={{background:"linear-gradient(180deg,#1a1510 0%,#0f0d0a 100%)",borderBottom:"1px solid #2a2320",padding:"28px 0 20px",textAlign:"center"}}>
         <div style={{fontSize:"10px",fontWeight:800,letterSpacing:".3em",color:"#c4913a",marginBottom:"6px"}}>COOPERSTOWN PROJECTION SYSTEM</div>
         <h1 style={{fontSize:"clamp(28px,5vw,40px)",fontWeight:900,fontFamily:"'Playfair Display',serif",color:"#e8dcc8",margin:0,letterSpacing:"-.02em",lineHeight:1.1}}>Hall of Fame Calculator</h1>
-        <div style={{fontSize:"12px",color:"#6b5c4a",marginTop:"8px"}}>Powered by MLB Stats API {"\u00B7"} Search any player in MLB history</div>
+        <div style={{fontSize:"12px",color:"#6b5c4a",marginTop:"8px"}}>Powered by Lahman SQL Database {"\u00B7"} Search any player in MLB history</div>
       </div>
 
       <div style={{maxWidth:"680px",margin:"0 auto",padding:"20px 16px 60px"}} key={resetKey}>
@@ -348,22 +501,30 @@ function App(){
         </div>
 
         {(ageNote||loading)&&<div style={{fontSize:"11px",color:"#c4913a",marginBottom:"10px",fontStyle:"italic",paddingLeft:"2px"}}>
-          {loading?<><span className="spinner" style={{marginRight:"6px"}}/>Loading from MLB API...</>:"\u2139\uFE0F "+ageNote}
+          {loading?<><span className="spinner" style={{marginRight:"6px"}}/>Loading Lahman SQL data...</>:"ℹ️ "+ageNote}
         </div>}
+
+        <div style={{marginBottom:"14px",padding:"10px",border:"1px solid #2a2320",borderRadius:"8px",background:"#14110e"}}>
+          <div style={{fontSize:"11px",color:"#8B7355",marginBottom:"6px"}}>Data source: {dataSourceStatus||"Initializing Lahman SQL..."}</div>
+          <label style={{fontSize:"11px",color:"#c4913a",cursor:"pointer"}}>
+            Upload Lahman .sqlite file
+            <input type="file" accept=".sqlite,.db,.sqlite3" onChange={handleSqlFile} style={{display:"block",marginTop:"6px",fontSize:"11px",color:"#e8dcc8"}}/>
+          </label>
+        </div>
 
         <div style={{marginBottom:"16px"}}>
           <label style={{display:"block",fontSize:"10px",fontWeight:600,letterSpacing:".08em",textTransform:"uppercase",color:"#8B7355",marginBottom:"6px"}}>Position</label>
           <div style={{display:"flex",gap:"3px",flexWrap:"wrap"}}>{positions.map(p=>(<button key={p} onClick={()=>setPosition(p)} style={{padding:"7px 10px",borderRadius:"6px",fontSize:"12px",fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer",minWidth:"36px",textAlign:"center",border:position===p?"1px solid #c4913a":"1px solid #2a2320",background:position===p?"rgba(196,145,58,.15)":"#1a1612",color:position===p?"#c4913a":"#6b5c4a"}}>{p}</button>))}</div>
         </div>
 
-        <div style={ss}><div style={st}>{isP?"\u26BE Pitching Stats (from MLB API)":"\u26BE Counting Stats (from MLB API)"}</div>
+        <div style={ss}><div style={st}>{isP?"\u26BE Pitching Stats (from Lahman)":"\u26BE Counting Stats (from Lahman)"}</div>
           {!isP?(<><div style={rw}><SI small label="Hits" name="hits" value={stats.hits} onChange={hsc}/><SI small label="Home Runs" name="hr" value={stats.hr} onChange={hsc}/><SI small label="RBI" name="rbi" value={stats.rbi} onChange={hsc}/><SI small label="Runs" name="runs" value={stats.runs} onChange={hsc}/></div>
             <div style={rw}><SI small label="SB" name="sb" value={stats.sb} onChange={hsc}/><SI small label="AVG" name="avg" value={stats.avg} onChange={hsc}/></div></>)
           :(<div style={rw}><SI small label="Wins" name="wins" value={stats.wins} onChange={hsc}/><SI small label="Strikeouts" name="k" value={stats.k} onChange={hsc}/><SI small label="Saves" name="saves" value={stats.saves} onChange={hsc}/><SI small label="IP" name="ip" value={stats.ip} onChange={hsc}/></div>)}
         </div>
 
         <div style={ss}><div style={{...st,color:"#e67e22"}}>{"\uD83D\uDCCA"} Advanced (enter from Baseball-Reference)</div>
-          <div style={{fontSize:"10px",color:"#6b5c4a",marginBottom:"10px"}}>WAR, OPS+, ERA+, JAWS not in MLB API. Look up on baseball-reference.com.</div>
+          <div style={{fontSize:"10px",color:"#6b5c4a",marginBottom:"10px"}}>WAR, OPS+, ERA+, JAWS not in Lahman SQL data. Look up on baseball-reference.com.</div>
           <div style={rw}><SI small label="Career bWAR" name="war" value={stats.war} onChange={hsc} placeholder="e.g. 72.8"/><SI small label="Peak 7yr WAR" name="peak7war" value={stats.peak7war} onChange={hsc} placeholder="e.g. 42.8"/></div>
           <div style={rw}>{!isP?<SI small label="OPS+" name="opsPlus" value={stats.opsPlus} onChange={hsc} placeholder="e.g. 145"/>:<SI small label="ERA+" name="eraPlus" value={stats.eraPlus} onChange={hsc} placeholder="e.g. 135"/>}</div>
         </div>
@@ -417,8 +578,8 @@ function App(){
         <div style={{marginTop:"24px",padding:"14px",background:"#14110e",borderRadius:"10px",border:"1px solid #1e1a16"}}>
           <div style={{fontSize:"10px",fontWeight:700,letterSpacing:".1em",color:"#4a3f33",marginBottom:"6px",textTransform:"uppercase"}}>How It Works</div>
           <div style={{fontSize:"11px",color:"#5a4e3e",lineHeight:1.6}}>
-            <b style={{color:"#8B7355"}}>Auto-filled:</b> Counting stats (H, HR, RBI, W, K, etc.), position, and age pulled live from the MLB Stats API. Change the age to see actual year-by-year stats through that season.
-            <br/><br/><b style={{color:"#e67e22"}}>Manual:</b> WAR, Peak WAR, OPS+, ERA+, awards — look these up on <b>baseball-reference.com</b>.
+            <b style={{color:"#8B7355"}}>Auto-filled:</b> Counting stats (H, HR, RBI, W, K, etc.), position, and age loaded from the Lahman Database. Change the age to see actual year-by-year stats through that season.
+            <br/><br/><b style={{color:"#e67e22"}}>Manual:</b> WAR, Peak WAR, OPS+, ERA+ still manual (not in core Lahman). Awards auto-fill from the SQL dataset.
             <br/><br/><b style={{color:"#8B7355"}}>Model:</b> Weighted milestones + JAWS + aging curves for projections.
           </div>
         </div>
