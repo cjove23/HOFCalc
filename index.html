@@ -28,78 +28,137 @@ input[type="range"]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;b
 <div id="root"></div>
 <script type="text/babel">
 const{useState,useCallback,useMemo,useEffect,useRef}=React;
-const API="https://statsapi.mlb.com/api/v1";
+const LAHMAN_BASE="https://cdn.jsdelivr.net/gh/chadwickbureau/baseballdatabank@master/core";
+let lahmanCache=null;
+const playerStatsCache={batting:{},pitching:{}};
 
 /* ═══════════════════════════════════════════
-   MLB STATS API — search, person, stats
-   Three search strategies with fallbacks
+   LAHMAN DATABASE — search, person, stats
    ═══════════════════════════════════════════ */
+
+function csvRow(line){
+  const out=[];let cur="",q=false;
+  for(let i=0;i<line.length;i++){
+    const ch=line[i];
+    if(ch==='"'){
+      if(q&&line[i+1]==='"'){cur+='"';i++}
+      else q=!q;
+    }else if(ch===','&&!q){out.push(cur);cur=""}
+    else cur+=ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function csvParse(text){
+  const lines=text.trim().split(/\r?\n/);if(!lines.length)return[];
+  const head=csvRow(lines[0]);
+  return lines.slice(1).filter(Boolean).map(line=>{const cols=csvRow(line);const row={};for(let i=0;i<head.length;i++)row[head[i]]=cols[i]||"";return row});
+}
+
+function toInnings(ipouts){
+  const outs=parseInt(ipouts||0,10);if(!outs)return"0.0";
+  const whole=Math.floor(outs/3),rem=outs%3;
+  return `${whole}.${rem}`;
+}
+
+async function loadLahman(){
+  if(lahmanCache)return lahmanCache;
+  const [peopleCsv,appsCsv]=await Promise.all([
+    fetch(`${LAHMAN_BASE}/People.csv`).then(r=>r.text()),
+    fetch(`${LAHMAN_BASE}/Appearances.csv`).then(r=>r.text())
+  ]);
+  const people=csvParse(peopleCsv),apps=csvParse(appsCsv);
+
+  const peopleById={},appByPlayer={};
+  for(const p of people){
+    const name=[p.nameFirst,p.nameLast].filter(Boolean).join(" ").trim();if(!name)continue;
+    peopleById[p.playerID]={
+      id:p.playerID,name,birthYear:parseInt(p.birthYear||0,10)||null,
+      debutYear:p.debut?parseInt(p.debut.substring(0,4),10):null,
+      finalYear:p.finalGame?parseInt(p.finalGame.substring(0,4),10):null
+    };
+  }
+  for(const a of apps){
+    if(!appByPlayer[a.playerID])appByPlayer[a.playerID]={P:0,C:0,"1B":0,"2B":0,"3B":0,SS:0,LF:0,CF:0,RF:0,DH:0};
+    const s=appByPlayer[a.playerID];
+    s.P+=parseInt(a.G_p||0,10);s.C+=parseInt(a.G_c||0,10);s["1B"]+=parseInt(a.G_1b||0,10);s["2B"]+=parseInt(a.G_2b||0,10);
+    s["3B"]+=parseInt(a.G_3b||0,10);s.SS+=parseInt(a.G_ss||0,10);s.LF+=parseInt(a.G_lf||0,10);s.CF+=parseInt(a.G_cf||0,10);
+    s.RF+=parseInt(a.G_rf||0,10);s.DH+=parseInt(a.G_dh||0,10);
+  }
+
+  lahmanCache={peopleById,appByPlayer};
+  return lahmanCache;
+}
+
+async function loadPlayerYearlyStats(playerId,isPitcher){
+  const kind=isPitcher?"pitching":"batting";
+  if(playerStatsCache[kind][playerId])return playerStatsCache[kind][playerId];
+
+  const file=isPitcher?"Pitching.csv":"Batting.csv";
+  const txt=await fetch(`${LAHMAN_BASE}/${file}`).then(r=>r.text());
+  const lines=txt.trim().split(/\r?\n/);if(lines.length<2)return[];
+  const head=csvRow(lines[0]);
+  const idx=Object.fromEntries(head.map((h,i)=>[h,i]));
+  const out=[];
+  for(let i=1;i<lines.length;i++){
+    const cols=csvRow(lines[i]);
+    if(cols[idx.playerID]!==playerId)continue;
+    if(isPitcher){
+      out.push({season:parseInt(cols[idx.yearID]||0,10),stat:{wins:parseInt(cols[idx.W]||0,10),strikeOuts:parseInt(cols[idx.SO]||0,10),saves:parseInt(cols[idx.SV]||0,10),inningsPitched:parseInt(cols[idx.IPouts]||0,10)/3,gamesPlayed:parseInt(cols[idx.G]||0,10)}});
+    }else{
+      out.push({season:parseInt(cols[idx.yearID]||0,10),stat:{hits:parseInt(cols[idx.H]||0,10),homeRuns:parseInt(cols[idx.HR]||0,10),rbi:parseInt(cols[idx.RBI]||0,10),runs:parseInt(cols[idx.R]||0,10),stolenBases:parseInt(cols[idx.SB]||0,10),atBats:parseInt(cols[idx.AB]||0,10),gamesPlayed:parseInt(cols[idx.G]||0,10)}});
+    }
+  }
+  playerStatsCache[kind][playerId]=out;
+  return out;
+}
 
 async function searchPlayers(query){
   if(!query||query.length<2)return[];
-
-  // 1) statsapi /people/search
   try{
-    const r=await fetch(API+"/people/search?names="+encodeURIComponent(query)+"&hydrate=currentTeam&limit=10");
-    if(r.ok){const d=await r.json();if(d.people?.length)return d.people.slice(0,10).map(p=>({
-      id:p.id,name:p.fullName,pos:p.primaryPosition?.abbreviation||"?",
-      currentAge:p.currentAge,active:p.active,
-      isPitcher:p.primaryPosition?.code==="1",team:p.currentTeam?.abbreviation||""
-    }))}
-  }catch(e){console.log("search strategy 1:",e.message)}
-
-  // 2) lookup-service-prod
-  try{
-    const r=await fetch("https://lookup-service-prod.mlb.com/json/named.search_player_all.bam?sport_code=%27mlb%27&name_part=%27"+encodeURIComponent(query)+"%25%27");
-    if(r.ok){const d=await r.json();const rows=d?.search_player_all?.queryResults?.row;if(rows){
-      const arr=Array.isArray(rows)?rows:[rows];
-      return arr.slice(0,10).map(p=>({
-        id:parseInt(p.player_id),name:p.name_display_first_last,pos:p.position||"?",
-        currentAge:null,active:p.active_sw==="Y",isPitcher:p.position==="P",team:p.team_abbrev||""
-      }))}}
-  }catch(e){console.log("search strategy 2:",e.message)}
-
-  // 3) suggest service
-  try{
-    const r=await fetch("https://suggest.mlb.com/svc/suggest/v1/min_all/"+encodeURIComponent(query)+"/10");
-    if(r.ok){const d=await r.json();if(d.suggestions?.length)return d.suggestions.filter(s=>s).map(s=>{
-      const p=s.split("|");return{id:parseInt(p[2]||0),name:p[1]||s,pos:"?",currentAge:null,active:true,isPitcher:false,team:""}
-    }).filter(p=>p.id>0)}
-  }catch(e){console.log("search strategy 3:",e.message)}
-
-  return[];
+    const d=await loadLahman();
+    const nowYear=new Date().getFullYear();
+    return Object.values(d.peopleById)
+      .filter(p=>p.name.toLowerCase().includes(query.toLowerCase()))
+      .sort((a,b)=>(b.finalYear||0)-(a.finalYear||0))
+      .slice(0,10)
+      .map(p=>{
+        const pos=mapPos(topPos(d.appByPlayer[p.id]||{}));
+        const age=p.birthYear?nowYear-p.birthYear:null;
+        const hasPitching=(d.appByPlayer[p.id]?.P||0)>0;
+        return{id:p.id,name:p.name,pos,currentAge:age,active:(p.finalYear||0)>=nowYear-1,isPitcher:hasPitching,team:""};
+      });
+  }catch(e){console.warn("Lahman search error:",e);return[]}
 }
 
-// Always fetch person details after selecting — gives correct position, age, birth date
 async function fetchPerson(pid){
   try{
-    const r=await fetch(API+"/people/"+pid);if(!r.ok)return null;
-    const d=await r.json();const p=d?.people?.[0];if(!p)return null;
-    return{id:p.id,name:p.fullName,pos:p.primaryPosition?.abbreviation||"?",
-      posCode:p.primaryPosition?.code||"",birthDate:p.birthDate,
-      currentAge:p.currentAge,active:p.active,
-      isPitcher:p.primaryPosition?.code==="1",
-      debutYear:p.mlbDebutDate?parseInt(p.mlbDebutDate.substring(0,4)):null};
+    const d=await loadLahman();const p=d.peopleById[pid];if(!p)return null;
+    const nowYear=new Date().getFullYear();
+    const pos=topPos(d.appByPlayer[pid]||{});
+    return{id:p.id,name:p.name,pos,birthDate:p.birthYear?`${p.birthYear}-01-01`:null,currentAge:p.birthYear?nowYear-p.birthYear:null,
+      active:(p.finalYear||0)>=nowYear-1,isPitcher:(d.appByPlayer[pid]?.P||0)>0,debutYear:p.debutYear};
   }catch(e){return null}
 }
 
 async function fetchStats(pid,isPitcher){
-  const g=isPitcher?"pitching":"hitting";
   try{
-    const[cr,yr]=await Promise.all([
-      fetch(API+"/people/"+pid+"/stats?stats=career&group="+g),
-      fetch(API+"/people/"+pid+"/stats?stats=yearByYear&group="+g+"&sportId=1")
-    ]);
-    const cd=await cr.json(),yd=await yr.json();
-    return{
-      career:cd?.stats?.[0]?.splits?.[0]?.stat||{},
-      yearByYear:(yd?.stats?.[0]?.splits||[]).map(s=>({season:parseInt(s.season),stat:s.stat})).sort((a,b)=>a.season-b.season)
-    };
+    const yby=await loadPlayerYearlyStats(pid,isPitcher);
+    const sorted=[...yby].sort((a,b)=>a.season-b.season);
+    const career=sorted.reduce((acc,s)=>{
+      Object.keys(s.stat).forEach(k=>acc[k]=(acc[k]||0)+(s.stat[k]||0));
+      return acc;
+    },{});
+    return{career,yearByYear:sorted};
   }catch(e){console.warn("Stats error:",e);return null}
 }
 
-function parseHitting(s){return{hits:s.hits!=null?String(s.hits):"",hr:s.homeRuns!=null?String(s.homeRuns):"",rbi:s.rbi!=null?String(s.rbi):"",runs:s.runs!=null?String(s.runs):"",sb:s.stolenBases!=null?String(s.stolenBases):"",avg:s.avg||""}}
-function parsePitching(s){return{wins:s.wins!=null?String(s.wins):"",k:s.strikeOuts!=null?String(s.strikeOuts):"",saves:s.saves!=null?String(s.saves):"",ip:s.inningsPitched||""}}
+function parseHitting(s){
+  let avg="";if((s.atBats||0)>0){avg=(s.hits/s.atBats).toFixed(3);if(avg[0]==="0")avg=avg.substring(1)}
+  return{hits:s.hits!=null?String(s.hits):"",hr:s.homeRuns!=null?String(s.homeRuns):"",rbi:s.rbi!=null?String(s.rbi):"",runs:s.runs!=null?String(s.runs):"",sb:s.stolenBases!=null?String(s.stolenBases):"",avg};
+}
+function parsePitching(s){return{wins:s.wins!=null?String(s.wins):"",k:s.strikeOuts!=null?String(s.strikeOuts):"",saves:s.saves!=null?String(s.saves):"",ip:toInnings(Math.round((s.inningsPitched||0)*3))}}
 
 function sumToAge(yby,birthYear,age,isP){
   const maxYear=birthYear+age;
@@ -114,11 +173,16 @@ function sumToAge(yby,birthYear,age,isP){
   return sum;
 }
 function parseSumH(s){return{hits:String(s.hits||0),hr:String(s.homeRuns||0),rbi:String(s.rbi||0),runs:String(s.runs||0),sb:String(s.stolenBases||0),avg:s.avg||""}}
-function parseSumP(s){return{wins:String(s.wins||0),k:String(s.strikeOuts||0),saves:String(s.saves||0),ip:String(Math.round(s.inningsPitched||0))}}
+function parseSumP(s){return{wins:String(s.wins||0),k:String(s.strikeOuts||0),saves:String(s.saves||0),ip:toInnings(Math.round((s.inningsPitched||0)*3))}}
 
-// Map MLB position abbreviation to our app's position codes
+function topPos(app){
+  const entries=Object.entries(app||{}).filter(([,v])=>v>0);if(!entries.length)return"DH";
+  return entries.sort((a,b)=>b[1]-a[1])[0][0];
+}
+
+// Map Lahman position code to our app's position codes
 function mapPos(pos){
-  const m={"P":"SP","TWP":"SP","LF":"LF","CF":"CF","RF":"RF","1B":"1B","2B":"2B","3B":"3B","SS":"SS","C":"C","DH":"DH","OF":"RF","IF":"SS"};
+  const m={"P":"SP","TWP":"SP","LF":"LF","CF":"CF","RF":"RF","1B":"1B","2B":"2B","3B":"3B","SS":"SS","C":"C","DH":"DH","OF":"RF","IF":"SS","PR":"RF","PH":"DH"};
   return m[pos]||"DH";
 }
 
@@ -273,7 +337,7 @@ function App(){
         setCache(data);
         const parsed=ispit?parsePitching(data.career):parseHitting(data.career);
         setStats({...E,...parsed});
-        setAgeNote("Stats loaded from MLB API");
+        setAgeNote("Stats loaded from Lahman Database");
       }else{
         setAgeNote("Could not load stats \u2014 enter manually");
       }
@@ -302,7 +366,7 @@ function App(){
       // Prior age — sum yearByYear
       const summed=sumToAge(cache.yearByYear,birthYear,age,isP);
       if(summed){const parsed=isP?parseSumP(summed):parseSumH(summed);setStats(prev=>({...prev,...parsed}));setAgeNote("Actual stats through age "+age+" season")}
-      else setAgeNote("No MLB data found for age "+age);
+      else setAgeNote("No Lahman data found for age "+age);
     }
     if(parseInt(projectionAge)<age)setProjectionAge(age);
   };
@@ -330,7 +394,7 @@ function App(){
       <div style={{background:"linear-gradient(180deg,#1a1510 0%,#0f0d0a 100%)",borderBottom:"1px solid #2a2320",padding:"28px 0 20px",textAlign:"center"}}>
         <div style={{fontSize:"10px",fontWeight:800,letterSpacing:".3em",color:"#c4913a",marginBottom:"6px"}}>COOPERSTOWN PROJECTION SYSTEM</div>
         <h1 style={{fontSize:"clamp(28px,5vw,40px)",fontWeight:900,fontFamily:"'Playfair Display',serif",color:"#e8dcc8",margin:0,letterSpacing:"-.02em",lineHeight:1.1}}>Hall of Fame Calculator</h1>
-        <div style={{fontSize:"12px",color:"#6b5c4a",marginTop:"8px"}}>Powered by MLB Stats API {"\u00B7"} Search any player in MLB history</div>
+        <div style={{fontSize:"12px",color:"#6b5c4a",marginTop:"8px"}}>Powered by Lahman Database {"\u00B7"} Search any player in MLB history</div>
       </div>
 
       <div style={{maxWidth:"680px",margin:"0 auto",padding:"20px 16px 60px"}} key={resetKey}>
@@ -348,7 +412,7 @@ function App(){
         </div>
 
         {(ageNote||loading)&&<div style={{fontSize:"11px",color:"#c4913a",marginBottom:"10px",fontStyle:"italic",paddingLeft:"2px"}}>
-          {loading?<><span className="spinner" style={{marginRight:"6px"}}/>Loading from MLB API...</>:"\u2139\uFE0F "+ageNote}
+          {loading?<><span className="spinner" style={{marginRight:"6px"}}/>Loading Lahman data...</>:"\u2139\uFE0F "+ageNote}
         </div>}
 
         <div style={{marginBottom:"16px"}}>
@@ -356,14 +420,14 @@ function App(){
           <div style={{display:"flex",gap:"3px",flexWrap:"wrap"}}>{positions.map(p=>(<button key={p} onClick={()=>setPosition(p)} style={{padding:"7px 10px",borderRadius:"6px",fontSize:"12px",fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",cursor:"pointer",minWidth:"36px",textAlign:"center",border:position===p?"1px solid #c4913a":"1px solid #2a2320",background:position===p?"rgba(196,145,58,.15)":"#1a1612",color:position===p?"#c4913a":"#6b5c4a"}}>{p}</button>))}</div>
         </div>
 
-        <div style={ss}><div style={st}>{isP?"\u26BE Pitching Stats (from MLB API)":"\u26BE Counting Stats (from MLB API)"}</div>
+        <div style={ss}><div style={st}>{isP?"\u26BE Pitching Stats (from Lahman)":"\u26BE Counting Stats (from Lahman)"}</div>
           {!isP?(<><div style={rw}><SI small label="Hits" name="hits" value={stats.hits} onChange={hsc}/><SI small label="Home Runs" name="hr" value={stats.hr} onChange={hsc}/><SI small label="RBI" name="rbi" value={stats.rbi} onChange={hsc}/><SI small label="Runs" name="runs" value={stats.runs} onChange={hsc}/></div>
             <div style={rw}><SI small label="SB" name="sb" value={stats.sb} onChange={hsc}/><SI small label="AVG" name="avg" value={stats.avg} onChange={hsc}/></div></>)
           :(<div style={rw}><SI small label="Wins" name="wins" value={stats.wins} onChange={hsc}/><SI small label="Strikeouts" name="k" value={stats.k} onChange={hsc}/><SI small label="Saves" name="saves" value={stats.saves} onChange={hsc}/><SI small label="IP" name="ip" value={stats.ip} onChange={hsc}/></div>)}
         </div>
 
         <div style={ss}><div style={{...st,color:"#e67e22"}}>{"\uD83D\uDCCA"} Advanced (enter from Baseball-Reference)</div>
-          <div style={{fontSize:"10px",color:"#6b5c4a",marginBottom:"10px"}}>WAR, OPS+, ERA+, JAWS not in MLB API. Look up on baseball-reference.com.</div>
+          <div style={{fontSize:"10px",color:"#6b5c4a",marginBottom:"10px"}}>WAR, OPS+, ERA+, JAWS not in Lahman data. Look up on baseball-reference.com.</div>
           <div style={rw}><SI small label="Career bWAR" name="war" value={stats.war} onChange={hsc} placeholder="e.g. 72.8"/><SI small label="Peak 7yr WAR" name="peak7war" value={stats.peak7war} onChange={hsc} placeholder="e.g. 42.8"/></div>
           <div style={rw}>{!isP?<SI small label="OPS+" name="opsPlus" value={stats.opsPlus} onChange={hsc} placeholder="e.g. 145"/>:<SI small label="ERA+" name="eraPlus" value={stats.eraPlus} onChange={hsc} placeholder="e.g. 135"/>}</div>
         </div>
@@ -417,7 +481,7 @@ function App(){
         <div style={{marginTop:"24px",padding:"14px",background:"#14110e",borderRadius:"10px",border:"1px solid #1e1a16"}}>
           <div style={{fontSize:"10px",fontWeight:700,letterSpacing:".1em",color:"#4a3f33",marginBottom:"6px",textTransform:"uppercase"}}>How It Works</div>
           <div style={{fontSize:"11px",color:"#5a4e3e",lineHeight:1.6}}>
-            <b style={{color:"#8B7355"}}>Auto-filled:</b> Counting stats (H, HR, RBI, W, K, etc.), position, and age pulled live from the MLB Stats API. Change the age to see actual year-by-year stats through that season.
+            <b style={{color:"#8B7355"}}>Auto-filled:</b> Counting stats (H, HR, RBI, W, K, etc.), position, and age loaded from the Lahman Database. Change the age to see actual year-by-year stats through that season.
             <br/><br/><b style={{color:"#e67e22"}}>Manual:</b> WAR, Peak WAR, OPS+, ERA+, awards — look these up on <b>baseball-reference.com</b>.
             <br/><br/><b style={{color:"#8B7355"}}>Model:</b> Weighted milestones + JAWS + aging curves for projections.
           </div>
