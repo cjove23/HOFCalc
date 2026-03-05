@@ -11,6 +11,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body,#root{height:100%;width:100%}
@@ -308,6 +309,7 @@ function App(){
   const[loading,setLoading]=useState(false);
   const[cache,setCache]=useState(null);
   const[birthYear,setBirthYear]=useState(null);
+  const[dataSourceStatus,setDataSourceStatus]=useState("");
   const isP=playerType==="pitcher";
 
   const E={war:"",peak7war:"",hits:"",hr:"",rbi:"",avg:"",opsPlus:"",allstar:"",mvp:"",goldGlove:"",runs:"",sb:"",wins:"",k:"",eraPlus:"",cyYoung:"",saves:"",ip:""};
@@ -315,6 +317,21 @@ function App(){
   const hsc=useCallback(e=>{setStats(p=>({...p,[e.target.name]:e.target.value}));setSubmitted(false)},[]);
 
   const resetAll=()=>{setStats({...E});setPlayerName("");setPlayerType("batter");setPosition("SS");setCurrentAge("");setProjectionAge(28);setShowProjection(false);setPerformanceMult(1);setSubmitted(false);setSelPlayer(null);setAgeNote("");setCache(null);setBirthYear(null);setLoading(false);setResetKey(k=>k+1)};
+
+  const handleSqlFile=async(e)=>{
+    const file=e.target.files?.[0];
+    if(!file)return;
+    try{
+      await importSqlDatabaseFromFile(file);
+      setDataSourceStatus(`Loaded SQL database: ${file.name}`);
+      setAgeNote("Lahman SQL loaded from local file");
+    }catch(err){
+      setDataSourceStatus("Failed to load selected SQL file");
+      setAgeNote("Could not open SQL file — please choose a valid Lahman .sqlite DB");
+    }finally{
+      e.target.value="";
+    }
+  };
 
   // ── Player selected from dropdown ──
   const handlePlayerSelect=async(p)=>{
@@ -415,6 +432,14 @@ function App(){
         {(ageNote||loading)&&<div style={{fontSize:"11px",color:"#c4913a",marginBottom:"10px",fontStyle:"italic",paddingLeft:"2px"}}>
           {loading?<><span className="spinner" style={{marginRight:"6px"}}/>Loading Lahman data...</>:"\u2139\uFE0F "+ageNote}
         </div>}
+
+        <div style={{marginBottom:"14px",padding:"10px",border:"1px solid #2a2320",borderRadius:"8px",background:"#14110e"}}>
+          <div style={{fontSize:"11px",color:"#8B7355",marginBottom:"6px"}}>Data source: {dataSourceStatus||"Initializing Lahman SQL..."}</div>
+          <label style={{fontSize:"11px",color:"#c4913a",cursor:"pointer"}}>
+            Upload Lahman .sqlite file
+            <input type="file" accept=".sqlite,.db,.sqlite3" onChange={handleSqlFile} style={{display:"block",marginTop:"6px",fontSize:"11px",color:"#e8dcc8"}}/>
+          </label>
+        </div>
 
         <div style={{marginBottom:"16px"}}>
           <label style={{display:"block",fontSize:"10px",fontWeight:600,letterSpacing:".08em",textTransform:"uppercase",color:"#8B7355",marginBottom:"6px"}}>Position</label>
