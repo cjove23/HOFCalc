@@ -15,7 +15,9 @@ to Sleeper's public API straight from the browser.
 - **Tap "Lineups"** for a live, position-by-position head-to-head: each
   starter's live points, team/position, and the top scorer highlighted.
 - **Records**, team names, and avatars pulled straight from your leagues.
-- Works offline-tolerant: failed leagues show a note and retry on the next tick.
+- **Installable PWA** — web manifest + service worker + app icon, so it adds
+  to your home screen and launches full-screen like a native app, with an
+  offline-tolerant shell. Live Sleeper calls always bypass the cache.
 
 ## Usage
 
